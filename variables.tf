@@ -21,7 +21,7 @@ variable "node_name" {
 variable "template_vm_id" {
   description = "The VM ID of the template to clone"
   type        = number
-  default = 101
+  default = 555
 }
 
 variable "template_node" {
