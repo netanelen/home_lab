@@ -1,0 +1,253 @@
+---
+- name: Prepare all nodes for Kubernetes installation
+  hosts: k8s_cluster
+  become: true
+  vars:
+    k8s_version: "1.28.0-00"
+    containerd_version: "1.7.0-1"
+  tasks:
+    - name: Update apt package index
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+          - wget
+          - git
+        state: present
+
+    - name: Disable swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+      ignore_errors: true
+
+    - name: Load required kernel modules
+      modprobe:
+        name: "{{ item }}"
+      loop:
+        - br_netfilter
+        - overlay
+      ignore_errors: true
+
+    - name: Make kernel modules persistent
+      lineinfile:
+        path: /etc/modules-load.d/k8s.conf
+        line: "{{ item }}"
+        create: true
+      loop:
+        - br_netfilter
+        - overlay
+
+    - name: Configure sysctl for Kubernetes
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: true
+      loop:
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { key: 'net.ipv4.ip_forward', value: '1' }
+
+    - name: Make sysctl changes persistent
+      lineinfile:
+        path: /etc/sysctl.conf
+        line: "{{ item.key }} = {{ item.value }}"
+        regexp: "^{{ item.key }}"
+      loop:
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { key: 'net.ipv4.ip_forward', value: '1' }
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install containerd
+      apt:
+        name: containerd.io={{ containerd_version }}
+        state: present
+
+    - name: Configure containerd
+      copy:
+        content: |
+          version = 2
+          [plugins."io.containerd.grpc.v1.cri"]
+            [plugins."io.containerd.grpc.v1.cri".containerd]
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                  runtime_type = "io.containerd.runc.v2"
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                    SystemdCgroup = true
+        dest: /etc/containerd/config.toml
+        mode: '0644'
+
+    - name: Start and enable containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: true
+
+    - name: Add Kubernetes GPG key
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: "deb https://apt.kubernetes.io/ kubernetes-xenial main"
+        state: present
+
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet={{ k8s_version }}
+          - kubeadm={{ k8s_version }}
+          - kubectl={{ k8s_version }}
+        state: present
+        update_cache: true
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Start and enable kubelet
+      systemd:
+        name: kubelet
+        state: started
+        enabled: true
+      ignore_errors: true
+
+- name: Initialize Kubernetes cluster on master nodes
+  hosts: k8s_masters
+  become: true
+  vars:
+    k8s_pod_cidr: "10.244.0.0/16"
+    k8s_service_cidr: "10.96.0.0/12"
+  tasks:
+    - name: Initialize Kubernetes cluster (first master only)
+      command: |
+        kubeadm init \
+          --pod-network-cidr={{ k8s_pod_cidr }} \
+          --service-cidr={{ k8s_service_cidr }} \
+          --control-plane-endpoint={{ ansible_default_ipv4.address }}:6443 \
+          --upload-certs
+      when: inventory_hostname == groups['k8s_masters'][0]
+      register: kubeadm_init
+
+    - name: Create .kube directory
+      file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Copy admin.conf to user directory
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+      when: inventory_hostname == groups['k8s_masters'][0]
+
+    - name: Extract join command for workers
+      shell: |
+        kubeadm token create --print-join-command
+      when: inventory_hostname == groups['k8s_masters'][0]
+      register: join_command
+
+    - name: Save join command to file
+      copy:
+        content: "{{ join_command.stdout }}"
+        dest: /tmp/join-command.sh
+        mode: '0755'
+      when: inventory_hostname == groups['k8s_masters'][0]
+
+    - name: Install Flannel CNI
+      shell: |
+        kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      when: inventory_hostname == groups['k8s_masters'][0]
+
+    - name: Wait for nodes to be ready
+      shell: kubectl get nodes
+      register: nodes_status
+      until: "'Ready' in nodes_status.stdout"
+      retries: 30
+      delay: 10
+      when: inventory_hostname == groups['k8s_masters'][0]
+
+- name: Join worker nodes to cluster
+  hosts: k8s_workers
+  become: true
+  tasks:
+    - name: Copy join command from master
+      fetch:
+        src: /tmp/join-command.sh
+        dest: /tmp/join-command.sh
+        flat: true
+
+    - name: Execute join command
+      shell: /tmp/join-command.sh
+      register: join_result
+
+    - name: Verify node joined successfully
+      shell: kubectl get nodes
+      delegate_to: "{{ groups['k8s_masters'][0] }}"
+      become: true
+      become_user: ubuntu
+      register: cluster_nodes
+
+    - name: Display cluster status
+      debug:
+        msg: "{{ cluster_nodes.stdout_lines }}"
+
+- name: Configure kubectl access
+  hosts: localhost
+  tasks:
+    - name: Create local kubectl config
+      copy:
+        content: |
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              server: https://{{ hostvars[groups['k8s_masters'][0]]['ansible_default_ipv4']['address'] }}:6443
+              insecure-skip-tls-verify: true
+            name: {{ k8s_cluster_name }}
+          contexts:
+          - context:
+              cluster: {{ k8s_cluster_name }}
+              user: admin
+            name: {{ k8s_cluster_name }}
+          current-context: {{ k8s_cluster_name }}
+          users:
+          - name: admin
+            user:
+              client-certificate-data: {{ lookup('file', '/etc/kubernetes/pki/admin.crt', errors='ignore') | b64encode }}
+              client-key-data: {{ lookup('file', '/etc/kubernetes/pki/admin.key', errors='ignore') | b64encode }}
+        dest: ~/.kube/config
+        mode: '0600'
+      delegate_to: "{{ groups['k8s_masters'][0] }}"
+      become: true

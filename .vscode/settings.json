@@ -1,0 +1,9 @@
+{
+    "cSpell.words": [
+        "containerd",
+        "kubeadm",
+        "Pprox",
+        "vmbr"
+    ],
+    "ansible.python.interpreterPath": "/Users/netanele/home_lab/proxmox/.venv/bin/python"
+}
