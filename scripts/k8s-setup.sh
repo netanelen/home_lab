@@ -65,7 +65,11 @@ deploy_infrastructure() {
     
     print_status "Infrastructure deployment completed."
     
+    print_warning "Waiting 60 seconds for VMs to boot and initialize network..."
+    sleep 180
+    
     # Wait for VMs to get IP addresses
+   
     print_status "Waiting for VMs to get IP addresses..."
     ./scripts/wait-for-ips.sh wait
 }
